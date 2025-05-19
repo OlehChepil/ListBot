@@ -1,112 +1,93 @@
+import logging
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters
+)
 
-# Спільний список записів (у пам'яті)
-entries = []
-entry_id_counter = 1
+# Заміни цей токен своїм
+BOT_TOKEN = "7561246127:AAEgKE1s61hM9d3si2eQ1gSECX5cMdC_-bM"
 
-# Зв'язки для переписки між користувачами
-user_pairs = {}
+# Глобальні словники
+user_data = {}  # username → user_id
+connected_users = {}  # user_id → user_id
 
+# Налаштування логів
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# /start — зберігає username користувача
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привіт! Я бот. Використовуй /add, /list, /positive, /delete для роботи з записами. /connect <@username> — для переписки.")
-
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global entry_id_counter
-    text = ' '.join(context.args)
-    if not text:
-        await update.message.reply_text("Будь ласка, введіть текст запису після команди /add")
-        return
-    entries.append({"id": entry_id_counter, "text": text, "status": "negative"})
-    await update.message.reply_text(f"Додано запис з ID {entry_id_counter}.")
-    entry_id_counter += 1
-
-async def list_entries(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not entries:
-        await update.message.reply_text("Список порожній.")
-        return
-    response = "\n".join([f"{e['id']}: {e['text']} [{e['status']}]" for e in entries])
-    await update.message.reply_text(response)
-
-async def positive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        entry_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Вкажіть коректний ID: /positive <id>")
-        return
-    for e in entries:
-        if e['id'] == entry_id:
-            e['status'] = 'positive'
-            await update.message.reply_text(f"Статус запису {entry_id} змінено на positive.")
-            return
-    await update.message.reply_text("Запис не знайдено.")
-
-async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        entry_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Вкажіть коректний ID: /delete <id>")
-        return
-    global entries
-    new_entries = [e for e in entries if e['id'] != entry_id]
-    if len(new_entries) == len(entries):
-        await update.message.reply_text("Запис не знайдено.")
+    user = update.effective_user
+    if user.username:
+        user_data[user.username.lower()] = user.id
+        await update.message.reply_text(f"Привіт, @{user.username}! Вас зареєстровано ✅")
     else:
-        entries[:] = new_entries
-        await update.message.reply_text(f"Запис {entry_id} видалено.")
+        await update.message.reply_text("У вас немає username — встановіть його в Telegram ⚠️")
 
+# /connect @username — встановлює з’єднання
 async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Використовуйте: /connect <@username>")
-        return
-    from_user = update.effective_user.id
-    to_username = context.args[0].lstrip('@')
-    to_user = None
-
-    for user in context.application.chat_data:
-        if context.application.chat_data[user].get('username') == to_username:
-            to_user = user
-            break
-
-    if not to_user:
-        await update.message.reply_text("Користувача не знайдено або він ще не писав боту.")
+        await update.message.reply_text("Вкажіть username користувача. Наприклад:\n/connect @username")
         return
 
-    user_pairs[from_user] = to_user
-    user_pairs[to_user] = from_user
-    await update.message.reply_text("Зв'язок встановлено. Тепер ваші повідомлення будуть пересилатись.")
+    target_username = context.args[0].lstrip('@').lower()
+    sender_id = update.effective_user.id
 
+    if target_username not in user_data:
+        await update.message.reply_text("Користувач не знайдений або не писав боту 😕")
+        return
+
+    receiver_id = user_data[target_username]
+
+    connected_users[sender_id] = receiver_id
+    connected_users[receiver_id] = sender_id
+
+    await update.message.reply_text(f"🔗 Ви підключились до @{target_username}")
+    try:
+        await context.bot.send_message(chat_id=receiver_id, text=f"🔗 @{update.effective_user.username} підключився до вас")
+    except Exception as e:
+        logger.error("Не вдалося надіслати повідомлення: %s", e)
+
+# /stop — роз'єднує користувачів
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    partner = user_pairs.pop(user_id, None)
-    if partner:
-        user_pairs.pop(partner, None)
-    await update.message.reply_text("Зв'язок розірвано.")
+    partner_id = connected_users.pop(user_id, None)
 
+    if partner_id:
+        connected_users.pop(partner_id, None)
+        await context.bot.send_message(chat_id=partner_id, text="❌ Співрозмовник завершив діалог.")
+        await update.message.reply_text("Ви завершили діалог.")
+    else:
+        await update.message.reply_text("Ви не підключені до жодного користувача.")
+
+# Пересилання повідомлень
 async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in user_pairs:
-        partner_id = user_pairs[user_id]
+    sender_id = update.effective_user.id
+    partner_id = connected_users.get(sender_id)
+
+    if partner_id:
         try:
             await context.bot.send_message(chat_id=partner_id, text=update.message.text)
         except Exception as e:
-            await update.message.reply_text("Не вдалося надіслати повідомлення користувачу.")
+            logger.error("Не вдалося переслати повідомлення: %s", e)
+    else:
+        await update.message.reply_text("Ви не підключені до жодного користувача. Використайте /connect")
 
-async def store_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.chat_data[update.effective_user.id] = {'username': update.effective_user.username}
-
-if __name__ == '__main__':
-    app = ApplicationBuilder().token("7561246127:AAEgKE1s61hM9d3si2eQ1gSECX5cMdC_-bM").build()
+# Запуск бота
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(CommandHandler("list", list_entries))
-    app.add_handler(CommandHandler("positive", positive))
-    app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("connect", connect))
     app.add_handler(CommandHandler("stop", stop))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_message))
-    app.add_handler(MessageHandler(filters.ALL, store_username))
 
+    print("✅ Бот запущено...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
